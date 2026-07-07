@@ -45,8 +45,8 @@ Two levers do most of the work, and the design leans on both:
 
 1. **Go around, don't go through.** The biggest single win is finding the JSON
    API a page fetches its data from and hitting that directly — usually far
-   less defended and returns clean structured data. See
-   [`examples/example_api_discovery.py`](examples/example_api_discovery.py).
+   less defended and returns clean structured data. This is automated: see
+   **[Find the hidden API](#find-the-hidden-api)** below.
 2. **Be a real browser, not a copy of one.** `curl_cffi` copies a current
    browser's TLS/JA3 + HTTP2 fingerprint at the network layer; when JS is
    required, we drive an actual Chrome rather than hand-faking the hundreds of
@@ -54,6 +54,38 @@ Two levers do most of the work, and the design leans on both:
    [`examples/example_fingerprint_check.py`](examples/example_fingerprint_check.py)
    proves the network-layer copy: our JA3/JA4 read as Chrome, a stdlib request
    reads as Python.
+
+## Find the hidden API
+
+Most "hard to scrape" pages are SPAs that fetch their data from a JSON endpoint.
+That endpoint is usually far less defended than the page and hands you clean,
+structured, paginated data — no HTML parsing. Finding it by hand means opening
+DevTools and reading the Network tab; this does it for you:
+
+```bash
+python -m resilient_scraper "https://quotes.toscrape.com/scroll" --discover
+```
+
+```
+# https://quotes.toscrape.com/scroll
+  [ 10.0] GET  https://quotes.toscrape.com/api/quotes?page=1
+           dict -> 'quotes': list of 10 objects · keys: author, tags, text
+  [ 10.0] GET  https://quotes.toscrape.com/api/quotes?page=2
+  ...
+```
+
+It opens the page in a real browser, watches every network response, keeps the
+ones returning JSON, and ranks them by how much they look like *the* data
+source (a list of records scores highest). It even surfaces the pagination
+pattern. Then you fetch the endpoint directly with the fast Layer 1 — see
+[`examples/example_discover_api.py`](examples/example_discover_api.py).
+
+```python
+from resilient_scraper import discover_apis, Fetcher
+endpoints = discover_apis("https://quotes.toscrape.com/scroll")
+best = endpoints[0]                       # ranked, best first
+data = Fetcher().fetch(best.url).text     # hit the JSON directly, no browser
+```
 
 ## Install
 
@@ -139,6 +171,7 @@ target's terms; when a job asks you to cross that line, decline it.
 resilient_scraper/
   fetcher.py   orchestrator — the escalation ladder
   layers.py    the strategies (curl_cffi, Playwright, nodriver)
+  discover.py  hidden-API discovery (the "go around" tool)
   utils.py     rate limiting, block detection, backoff
   export.py    CSV run report + body dumps
   config.py    every tunable, with defaults
@@ -146,6 +179,7 @@ resilient_scraper/
   __main__.py  the `python -m resilient_scraper` CLI
 examples/
   example_basic.py
+  example_discover_api.py
   example_api_discovery.py
   example_fingerprint_check.py
 ```

@@ -31,6 +31,9 @@ def main(argv: list[str] | None = None) -> int:
         description="Layered, polite fetcher for public web data.",
     )
     parser.add_argument("urls", nargs="*", help="one or more URLs to fetch")
+    parser.add_argument("--discover", action="store_true",
+                        help="instead of fetching, find the JSON API(s) each "
+                             "page calls under the hood and print them")
     parser.add_argument("--file", help="text file with one URL per line")
     parser.add_argument("--out", default="output", help="output directory")
     parser.add_argument("--save-bodies", action="store_true",
@@ -45,6 +48,17 @@ def main(argv: list[str] | None = None) -> int:
     urls = _read_urls(args)
     if not urls:
         parser.error("give at least one URL, or --file with URLs")
+
+    if args.discover:
+        from .discover import discover_apis
+        for url in urls:
+            print(f"\n# {url}")
+            endpoints = discover_apis(url)
+            if not endpoints:
+                print("  no JSON API detected (likely server-rendered)")
+            for ep in endpoints:
+                print("  " + ep.line().replace("\n", "\n  "))
+        return 0
 
     config = ScraperConfig(
         min_delay=args.min_delay,
