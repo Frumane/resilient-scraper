@@ -101,7 +101,13 @@ def discover_apis(
       "playwright" — force Playwright (needs `playwright install chromium`)."""
     use_nodriver = engine == "nodriver" or (engine == "auto" and _nodriver_ready())
     if use_nodriver:
-        return _discover_nodriver(url, wait, scroll, headless, max_results)
+        results = _discover_nodriver(url, wait, scroll, headless, max_results)
+        # A headless run that finds nothing on a protected site is the classic
+        # "the bot check hid everything" case — a visible window clears far more
+        # challenges, so retry headful once before giving up.
+        if not results and headless:
+            results = _discover_nodriver(url, wait, scroll, False, max_results)
+        return results
     return _discover_playwright(url, wait, scroll, headless, max_results)
 
 
