@@ -1,0 +1,10 @@
+# Layer 1 — real-browser TLS/HTTP2 fingerprint. Required.
+curl_cffi>=0.7
+
+# Layer 2 — headless browser for JS-rendered pages. Optional.
+# After installing, run once:  python -m playwright install chromium
+playwright>=1.44
+
+# Layer 3 — undetected real Chrome over CDP, for managed challenges
+# (Cloudflare/DataDome). Optional; uses your installed Chrome. Recommended.
+nodriver>=0.38
