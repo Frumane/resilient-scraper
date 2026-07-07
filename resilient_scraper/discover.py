@@ -14,7 +14,9 @@ Public data only — same scope rules as the rest of the package."""
 
 from __future__ import annotations
 
+import asyncio
 import json
+import sys
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -60,47 +62,132 @@ def _describe_json(data: Any) -> tuple[str, float]:
     return type(data).__name__, 1.0
 
 
+def _rank(found: dict[str, ApiEndpoint], max_results: int) -> list[ApiEndpoint]:
+    return sorted(found.values(), key=lambda e: e.score, reverse=True)[:max_results]
+
+
+def _record(found: dict, url: str, method: str, status: int, ctype: str,
+            rtype: str, body: str) -> None:
+    """Shared scoring logic: turn one JSON response into a ranked ApiEndpoint."""
+    try:
+        data = json.loads(body)
+    except Exception:  # noqa: BLE001
+        return
+    shape, score = _describe_json(data)
+    score += min(len(body), 200_000) / 100_000
+    found[url] = ApiEndpoint(
+        method=method, url=url, status=status,
+        content_type=ctype.split(";")[0], size=len(body),
+        resource_type=rtype, score=round(score, 1), preview=shape, sample=data,
+    )
+
+
 def discover_apis(
     url: str,
     wait: float = 6.0,
     scroll: bool = True,
     headless: bool = True,
     max_results: int = 10,
+    engine: str = "auto",
 ) -> list[ApiEndpoint]:
     """Load `url` in a real browser and return the data-bearing endpoints it
-    called, best first. Requires Playwright (`pip install playwright` +
-    `python -m playwright install chromium`)."""
+    called, best first.
+
+    engine:
+      "auto"       — use nodriver (undetected real Chrome) if installed, which
+                     clears the bot checks that hide a protected site's API;
+                     otherwise fall back to Playwright.
+      "nodriver"   — force the undetected-Chrome engine.
+      "playwright" — force Playwright (needs `playwright install chromium`)."""
+    use_nodriver = engine == "nodriver" or (engine == "auto" and _nodriver_ready())
+    if use_nodriver:
+        return _discover_nodriver(url, wait, scroll, headless, max_results)
+    return _discover_playwright(url, wait, scroll, headless, max_results)
+
+
+def _nodriver_ready() -> bool:
+    try:
+        import nodriver  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _discover_nodriver(url, wait, scroll, headless, max_results):  # noqa: ANN001
+    """Capture data endpoints via nodriver + raw CDP Network events. Because
+    it drives a genuine, un-flagged Chrome, the page actually loads its data —
+    so its hidden API is visible where a vanilla headless browser gets blocked."""
+    if sys.platform == "win32":
+        from .layers import _silence_proactor_del_noise
+        _silence_proactor_del_noise()
+
+    async def run() -> dict[str, ApiEndpoint]:
+        import nodriver as uc
+        from nodriver import cdp
+
+        found: dict[str, ApiEndpoint] = {}
+        # url -> (status, mime, rtype). Keyed by URL so repeated pages dedupe.
+        seen: dict[str, tuple] = {}
+        browser = await uc.start(headless=headless)
+        try:
+            tab = await browser.get("about:blank")
+            await tab.send(cdp.network.enable())
+
+            async def on_response(evt: "cdp.network.ResponseReceived") -> None:
+                r = evt.response
+                rtype = str(getattr(evt, "type_", "") or "")
+                if "json" in (r.mime_type or "").lower() and 200 <= r.status < 300:
+                    seen.setdefault(r.url, (r.status, r.mime_type, rtype))
+
+            tab.add_handler(cdp.network.ResponseReceived, on_response)
+            await tab.get(url)
+
+            # Let late XHRs fire; scrolling triggers infinite-scroll loaders.
+            rounds = 3 if scroll else 1
+            for _ in range(rounds):
+                if scroll:
+                    await tab.scroll_down(300)
+                await tab.sleep(wait / rounds)
+
+            # Retrieve each body by re-fetching it *inside the page* — runs with
+            # the browser's cookies and un-flagged fingerprint, so it succeeds
+            # where a bare CDP body-read (or an outside HTTP client) would be
+            # blocked. Reliable, and it dodges CDP's response-buffer eviction.
+            for u, (status, mime, rtype) in list(seen.items()):
+                try:
+                    js = f"fetch({u!r}, {{credentials: 'include'}}).then(r => r.text())"
+                    body = await tab.evaluate(js, await_promise=True)
+                    if body:
+                        _record(found, u, "GET", status, mime or "", rtype or "xhr", body)
+                except Exception:  # noqa: BLE001 - skip anything we can't re-read
+                    continue
+            return found
+        finally:
+            try:
+                browser.stop()
+            except Exception:  # noqa: BLE001
+                pass
+
+    found = asyncio.run(run())
+    return _rank(found, max_results)
+
+
+def _discover_playwright(url, wait, scroll, headless, max_results):  # noqa: ANN001
+    """Load `url` in Playwright and capture data endpoints. Simpler than the
+    nodriver path but detectable — protected sites may hide their API from it."""
     from playwright.sync_api import sync_playwright
 
     found: dict[str, ApiEndpoint] = {}
 
     def on_response(response) -> None:  # noqa: ANN001
         try:
-            req = response.request
-            rtype = req.resource_type
-            if rtype not in ("xhr", "fetch"):
-                return
+            rtype = response.request.resource_type
             ctype = (response.headers or {}).get("content-type", "")
-            if "json" not in ctype.lower():
+            if rtype not in ("xhr", "fetch") or "json" not in ctype.lower():
                 return
-            if not (200 <= response.status < 300):
-                return
-            body = response.text()
-            data = json.loads(body)
-            shape, score = _describe_json(data)
-            # Prefer bigger payloads a touch — the real collection is rarely tiny.
-            score += min(len(body), 200_000) / 100_000
-            found[response.url] = ApiEndpoint(
-                method=req.method,
-                url=response.url,
-                status=response.status,
-                content_type=ctype.split(";")[0],
-                size=len(body),
-                resource_type=rtype,
-                score=round(score, 1),
-                preview=shape,
-                sample=data,
-            )
+            if 200 <= response.status < 300:
+                _record(found, response.url, response.request.method,
+                        response.status, ctype, rtype, response.text())
         except Exception:  # noqa: BLE001 - a body we can't read just isn't a hit
             return
 
@@ -118,5 +205,4 @@ def discover_apis(
             page.wait_for_timeout(int(wait * 1000))
         browser.close()
 
-    ranked = sorted(found.values(), key=lambda e: e.score, reverse=True)
-    return ranked[:max_results]
+    return _rank(found, max_results)
