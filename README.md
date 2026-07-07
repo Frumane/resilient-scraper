@@ -114,14 +114,29 @@ if result:                       # FetchResult is truthy when ok
     print("tried:", result.attempts)
 ```
 
-With residential/mobile proxies (recommended for tougher targets — datacenter
-IPs are often pre-flagged):
+### Proxies
+
+Rotating IPs is the legitimate answer to IP-based rate limiting. Pass a list
+and the fetcher rotates over them, tracks each one's failures, and retires a
+proxy on a cooldown once it fails too often (bringing it back after) — so a
+dead proxy doesn't silently tank your success rate. Residential/mobile are
+recommended for tough targets; datacenter IPs are often pre-flagged. Bring your
+own, or plug a provider's gateway straight in.
 
 ```python
 cfg = ScraperConfig(proxies=[
-    "http://user:pass@proxy1:port",
-    "http://user:pass@proxy2:port",
+    "http://user:pass@gate.provider.com:7000",
+    "http://user:pass@gate.provider.com:7001",
 ])
+fetcher = Fetcher(cfg)
+```
+
+Probe them up front and drop the dead ones before a run:
+
+```python
+from resilient_scraper import ProxyPool
+pool = ProxyPool(cfg.proxies)
+print(pool.check())      # {"alive": [...], "dead": [...]}
 ```
 
 ## Use it — command line
@@ -172,6 +187,7 @@ resilient_scraper/
   fetcher.py   orchestrator — the escalation ladder
   layers.py    the strategies (curl_cffi, Playwright, nodriver)
   discover.py  hidden-API discovery (the "go around" tool)
+  proxies.py   rotating proxy pool with health tracking + retirement
   utils.py     rate limiting, block detection, backoff
   export.py    CSV run report + body dumps
   config.py    every tunable, with defaults

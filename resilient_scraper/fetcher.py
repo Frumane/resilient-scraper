@@ -15,8 +15,9 @@ import time
 
 from .config import ScraperConfig
 from .layers import CurlCffiLayer, NodriverLayer, PlaywrightLayer
+from .proxies import ProxyPool
 from .result import FetchResult
-from .utils import RateLimiter, backoff_delay, looks_blocked, pick_proxy
+from .utils import RateLimiter, backoff_delay, looks_blocked
 
 
 class Fetcher:
@@ -24,6 +25,7 @@ class Fetcher:
         self.config = config or ScraperConfig()
         self.verbose = verbose
         self.rate_limiter = RateLimiter(self.config.min_delay, self.config.max_delay)
+        self.proxies = ProxyPool(self.config.proxies) if self.config.proxies else None
 
         # Build the ladder, cheapest first. Layer 1 (curl_cffi) is always
         # present; the browser layers are added only if enabled AND installed.
@@ -37,6 +39,10 @@ class Fetcher:
         if self.verbose:
             print(f"[resilient-scraper] {msg}")
 
+    def _report(self, proxy: str | None, ok: bool) -> None:
+        if self.proxies is not None:
+            self.proxies.report(proxy, ok)
+
     def fetch(self, url: str) -> FetchResult:
         """Fetch one URL, escalating through layers until one succeeds."""
         self.rate_limiter.wait(url)
@@ -45,19 +51,22 @@ class Fetcher:
 
         for layer in self._layers:
             for attempt in range(self.config.max_retries):
-                proxy = pick_proxy(self.config.proxies, attempt)
-                tag = f"{layer.name}#{attempt + 1}" + (f"+proxy" if proxy else "")
+                proxy = self.proxies.get() if self.proxies else None
+                tag = f"{layer.name}#{attempt + 1}" + ("+proxy" if proxy else "")
                 attempts.append(tag)
 
                 result = layer.fetch(url, proxy=proxy)
                 last_result = result
 
                 if result.error:
+                    self._report(proxy, ok=False)
                     self._log(f"{tag} errored: {result.error}")
                 elif looks_blocked(result.status, result.text):
                     result.blocked = True
+                    self._report(proxy, ok=False)
                     self._log(f"{tag} blocked ({result.status})")
                 else:
+                    self._report(proxy, ok=True)
                     result.ok = True
                     result.attempts = attempts
                     self._log(f"{tag} OK — {result.short()}")

@@ -72,10 +72,3 @@ def backoff_delay(attempt: int, base: float, cap: float) -> float:
     raw = base ** attempt
     jittered = raw * random.uniform(0.7, 1.3)
     return min(jittered, cap)
-
-
-def pick_proxy(proxies: list[str], attempt: int) -> str | None:
-    """Rotate deterministically over the pool by attempt number."""
-    if not proxies:
-        return None
-    return proxies[attempt % len(proxies)]
