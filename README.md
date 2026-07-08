@@ -1,5 +1,7 @@
 # resilient-scraper
 
+![resilient-scraper](docs/thumbnail.png)
+
 A small, layered fetcher for **public** web data that survives real bot
 defence — JS-rendered pages, TLS/fingerprint checks, rate limits, and managed
 Cloudflare/DataDome challenges — without pretending to be magic.
@@ -179,6 +181,25 @@ Built for collecting **public** data — catalogues, listings, prices, public
 directories. **Not** for getting behind login walls, harvesting personal data,
 or anything a site's terms or the law forbid. Check `robots.txt` and the
 target's terms; when a job asks you to cross that line, decline it.
+
+## What this demonstrates
+
+A compact but real look at how modern scraping actually works when a site fights
+back — and how to do it responsibly:
+
+- **Escalation over brute force** — an orchestrator that measures each attempt
+  (block detection reading the body, not the status) and climbs only when it has
+  to, so easy targets stay cheap and hard ones still land.
+- **Network-layer vs. browser-layer evasion** — `curl_cffi` for a real
+  TLS/JA3 + HTTP2 fingerprint without a browser, real Chrome (Playwright /
+  nodriver) only when JS or a managed challenge demands it.
+- **The "go around" move** — automated hidden-API discovery via CDP: open the
+  page, watch its traffic, and rank the JSON endpoints it really pulls from.
+- **Production hygiene** — per-host rate limiting, exponential backoff with
+  jitter, a health-checked rotating proxy pool, a CSV audit trail, packaged with
+  `pyproject.toml` + a console entry point.
+- **Knowing the limits** — honest about where a free, home-grown client stops
+  (enterprise defences, CAPTCHAs) and a clear public-data-only ethics line.
 
 ## Layout
 

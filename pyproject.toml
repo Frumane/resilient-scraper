@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "resilient-scraper"
+version = "0.3.0"
+description = "Layered, polite scraper for public web data: TLS-fingerprint HTTP → real browser → undetected Chrome, with hidden-API discovery and a health-checked proxy pool."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Arda Karaman" }]
+keywords = ["scraping", "web-scraping", "curl_cffi", "playwright", "nodriver",
+            "anti-bot", "tls-fingerprint", "proxy", "api-discovery"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Intended Audience :: Developers",
+    "Topic :: Internet :: WWW/HTTP",
+]
+dependencies = ["curl_cffi>=0.7"]
+
+[project.optional-dependencies]
+# Browser layers + API discovery. Install with:  pip install resilient-scraper[browser]
+browser = ["playwright>=1.44", "nodriver>=0.38"]
+
+[project.scripts]
+resilient-scraper = "resilient_scraper.__main__:main"
+
+[project.urls]
+Repository = "https://github.com/Frumane/resilient-scraper"
+
+[tool.setuptools]
+packages = ["resilient_scraper"]
