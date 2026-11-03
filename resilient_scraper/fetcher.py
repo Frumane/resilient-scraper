@@ -53,6 +53,7 @@ class Fetcher:
         # The most informative failure seen: a blocked response (e.g. 403 +
         # challenge body) beats a later local error with no status/body.
         last_blocked: FetchResult | None = None
+        last_http: FetchResult | None = None   # last response with a status
 
         for layer in self._layers:
             for attempt in range(max(1, self.config.max_retries)):
@@ -65,6 +66,8 @@ class Fetcher:
                 result = layer.fetch(url, proxy=proxy)
                 self.rate_limiter.mark(url)
                 last_result = result
+                if result.status is not None and not result.error:
+                    last_http = result
 
                 if result.error:
                     # Only blame the proxy for failures it actually caused —
@@ -111,6 +114,8 @@ class Fetcher:
         # .ok, so a (falsy) blocked result would be thrown away by `or`.
         if last_blocked is not None:
             result = last_blocked
+        elif last_http is not None:
+            result = last_http
         elif last_result is not None:
             result = last_result
         else:

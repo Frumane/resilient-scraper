@@ -142,7 +142,7 @@ def _discover_nodriver(url, wait, scroll, headless, max_results):  # noqa: ANN00
         # url -> (status, mime, rtype, request_id). Keyed by URL so repeated
         # calls dedupe.
         seen: dict[str, tuple] = {}
-        methods: dict[str, str] = {}          # request_id -> HTTP method
+        requests: dict[str, Any] = {}        # request_id -> cdp Request
         browser = None
         try:
             browser = await uc.start(headless=headless)
@@ -154,7 +154,7 @@ def _discover_nodriver(url, wait, scroll, headless, max_results):  # noqa: ANN00
             ))
 
             async def on_request(evt: "cdp.network.RequestWillBeSent") -> None:
-                methods[str(evt.request_id)] = evt.request.method
+                requests[str(evt.request_id)] = evt.request
 
             async def on_response(evt: "cdp.network.ResponseReceived") -> None:
                 r = evt.response
@@ -178,23 +178,41 @@ def _discover_nodriver(url, wait, scroll, headless, max_results):  # noqa: ANN00
                     await tab.scroll_down(300)
                 await tab.sleep(wait / rounds)
 
-            # Read the body the page actually received (CDP getResponseBody):
-            # no second request, so POST/GraphQL and header-authenticated
-            # APIs keep their real method and body, and CORS never applies.
+            # Prefer the body the page actually received (CDP getResponseBody,
+            # no second request). Chrome often refuses that once the request
+            # has finished, so fall back to replaying the *same* request —
+            # method, body and page-set headers — from inside the page, with
+            # the browser's cookies and un-flagged fingerprint.
             for u, (status, mime, rtype, request_id) in list(seen.items()):
-                method = methods.get(str(request_id), "GET")
+                req = requests.get(str(request_id))
+                method = getattr(req, "method", None) or "GET"
+                body = ""
                 try:
                     body, b64 = await tab.send(
                         cdp.network.get_response_body(request_id))
                     if b64:
                         import base64
                         body = base64.b64decode(body).decode("utf-8", "replace")
-                except Exception:  # noqa: BLE001 - body evicted
-                    if method != "GET":
-                        continue  # can't faithfully replay a non-GET
+                except Exception:  # noqa: BLE001 - evicted / not retained
+                    init: dict[str, Any] = {"method": method}
+                    headers = dict(getattr(req, "headers", None) or {})
+                    # Headers the browser manages itself can't be set by JS.
+                    for h in list(headers):
+                        if h.lower() in ("cookie", "host", "content-length",
+                                         "user-agent", "referer", "origin") \
+                                or h.lower().startswith("sec-"):
+                            headers.pop(h)
+                    if headers:
+                        init["headers"] = headers
+                    post = getattr(req, "post_data", None)
+                    if post is not None:
+                        init["body"] = post
+                    elif method not in ("GET", "HEAD") and getattr(
+                            req, "has_post_data", False):
+                        continue  # body not available — can't replay faithfully
+                    js = (f"fetch({json.dumps(u)}, {json.dumps(init)})"
+                          ".then(r => r.ok ? r.text() : '')")
                     try:
-                        js = (f"fetch({json.dumps(u)}).then(r => r.ok ? r.text() "
-                              f": '')")
                         body = await tab.evaluate(js, await_promise=True)
                     except Exception:  # noqa: BLE001
                         continue

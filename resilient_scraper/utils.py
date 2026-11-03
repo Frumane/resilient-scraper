@@ -73,7 +73,9 @@ def looks_blocked(status: int | None, text: str) -> bool:
     if status in (401, 403, 429, 503):
         return True
     if not text:
-        return status is None or status >= 400
+        # An empty 404/500 is an HTTP error, not a bot wall — the fetcher
+        # handles it via is_http_error (no pointless browser escalation).
+        return False
     head = text[:4000].lower()
     return any(marker in head for marker in _BLOCK_MARKERS)
 
