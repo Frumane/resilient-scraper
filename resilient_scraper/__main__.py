@@ -19,9 +19,11 @@ from .fetcher import Fetcher
 def _read_urls(args: argparse.Namespace) -> list[str]:
     urls = list(args.urls)
     if args.file:
-        with open(args.file, encoding="utf-8") as fh:
-            urls += [line.strip() for line in fh if line.strip()
-                     and not line.startswith("#")]
+        with open(args.file, encoding="utf-8-sig") as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    urls.append(line)
     return urls
 
 
@@ -53,7 +55,11 @@ def main(argv: list[str] | None = None) -> int:
         from .discover import discover_apis
         for url in urls:
             print(f"\n# {url}")
-            endpoints = discover_apis(url)
+            try:
+                endpoints = discover_apis(url)
+            except Exception as exc:  # noqa: BLE001 - keep going for other URLs
+                print(f"  discovery failed: {type(exc).__name__}: {exc}")
+                continue
             if not endpoints:
                 print("  no JSON API detected (likely server-rendered)")
             for ep in endpoints:

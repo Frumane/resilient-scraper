@@ -17,7 +17,10 @@ from .config import ScraperConfig
 from .layers import CurlCffiLayer, NodriverLayer, PlaywrightLayer
 from .proxies import ProxyPool
 from .result import FetchResult
-from .utils import RateLimiter, backoff_delay, looks_blocked
+from .utils import (
+    RateLimiter, backoff_delay, is_http_error, is_proxy_error,
+    is_retryable_status, looks_blocked,
+)
 
 
 class Fetcher:
@@ -45,26 +48,47 @@ class Fetcher:
 
     def fetch(self, url: str) -> FetchResult:
         """Fetch one URL, escalating through layers until one succeeds."""
-        self.rate_limiter.wait(url)
         attempts: list[str] = []
         last_result: FetchResult | None = None
+        # The most informative failure seen: a blocked response (e.g. 403 +
+        # challenge body) beats a later local error with no status/body.
+        last_blocked: FetchResult | None = None
 
         for layer in self._layers:
-            for attempt in range(self.config.max_retries):
+            for attempt in range(max(1, self.config.max_retries)):
                 proxy = self.proxies.get() if self.proxies else None
                 tag = f"{layer.name}#{attempt + 1}" + ("+proxy" if proxy else "")
                 attempts.append(tag)
 
+                # Politeness applies to every outgoing request, not once per URL.
+                self.rate_limiter.wait(url)
                 result = layer.fetch(url, proxy=proxy)
+                self.rate_limiter.mark(url)
                 last_result = result
 
                 if result.error:
-                    self._report(proxy, ok=False)
+                    # Only blame the proxy for failures it actually caused —
+                    # a missing browser binary or a JS challenge says nothing
+                    # about the proxy's health.
+                    if is_proxy_error(result.error, result.status):
+                        self._report(proxy, ok=False)
                     self._log(f"{tag} errored: {result.error}")
                 elif looks_blocked(result.status, result.text):
                     result.blocked = True
-                    self._report(proxy, ok=False)
+                    last_blocked = result
+                    if result.status in (407, 429):
+                        self._report(proxy, ok=False)
                     self._log(f"{tag} blocked ({result.status})")
+                elif is_http_error(result.status):
+                    # A 404/500/502 page has a body but is not usable content.
+                    self._report(proxy, ok=True)  # the proxy delivered fine
+                    self._log(f"{tag} HTTP {result.status}")
+                    if not is_retryable_status(result.status):
+                        # 404/410/...: permanent — retrying or escalating to a
+                        # browser won't change the server's answer.
+                        result.ok = False
+                        result.attempts = attempts
+                        return result
                 else:
                     self._report(proxy, ok=True)
                     result.ok = True
@@ -82,13 +106,15 @@ class Fetcher:
 
             self._log(f"'{layer.name}' exhausted, escalating")
 
-        # Nothing worked — hand back the last thing we saw, flagged.
-        # NB: use an explicit None check, not `or`. A blocked result is a
-        # real, informative response (e.g. 403 + challenge body) but is falsy
-        # because FetchResult.__bool__ returns .ok — `or` would throw it away.
-        result = last_result if last_result is not None else FetchResult(
-            url=url, error="no layers ran",
-        )
+        # Nothing worked — hand back the most informative thing we saw.
+        # NB: use explicit None checks, not `or`: FetchResult.__bool__ returns
+        # .ok, so a (falsy) blocked result would be thrown away by `or`.
+        if last_blocked is not None:
+            result = last_blocked
+        elif last_result is not None:
+            result = last_result
+        else:
+            result = FetchResult(url=url, error="no layers ran")
         result.attempts = attempts
         result.ok = False
         self._log(f"gave up after {len(attempts)} attempts")

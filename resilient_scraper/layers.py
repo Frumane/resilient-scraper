@@ -8,18 +8,55 @@ Layer 2 — PlaywrightLayer: a real headless browser that executes JS. Slower,
           heavier, but renders SPA content and clears fingerprint checks that
           a bare HTTP client can't. Optional — only used if playwright is
           installed and enabled.
+Layer 3 — NodriverLayer: undetected real Chrome over raw CDP, last resort for
+          managed challenges. Optional.
 """
 
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import random
 import sys
 import time
+from urllib.parse import urlsplit
 
 from .config import BROWSER_PROFILES, ScraperConfig
 from .result import FetchResult
 from .utils import looks_blocked
+
+
+def split_proxy(proxy: str) -> tuple[str, str | None, str | None]:
+    """Split "scheme://user:pass@host:port" into (server, username, password).
+    Browsers take credentials separately from the proxy server address."""
+    parts = urlsplit(proxy if "://" in proxy else f"http://{proxy}")
+    host = parts.hostname or ""
+    if ":" in host:                      # IPv6 literal
+        host = f"[{host}]"
+    server = f"{parts.scheme}://{host}" + (f":{parts.port}" if parts.port else "")
+    return server, parts.username, parts.password
+
+
+def run_coro_sync(coro):  # noqa: ANN001, ANN201
+    """Run a coroutine to completion from sync code. asyncio.run() refuses to
+    start inside an already-running loop (Jupyter, async web handlers), so in
+    that case run it on a fresh loop in a worker thread instead."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
+
+
+# Chrome's own network-error interstitial (DNS failure, refused connection,
+# proxy failure...). Loading it is a failed navigation, not page content.
+_CHROME_ERROR_MARKERS = ('id="main-frame-error"', "neterror", "chrome-error://")
+
+
+def _is_chrome_error_page(html: str) -> bool:
+    head = html[:20000]
+    return any(m in head for m in _CHROME_ERROR_MARKERS)
 
 
 class CurlCffiLayer:
@@ -96,18 +133,29 @@ class PlaywrightLayer:
             with sync_playwright() as p:
                 launch_kwargs: dict = {"headless": self.config.headless}
                 if proxy:
-                    launch_kwargs["proxy"] = {"server": proxy}
+                    # Playwright ignores user:pass embedded in `server`;
+                    # credentials must be passed as separate keys.
+                    server, username, password = split_proxy(proxy)
+                    proxy_cfg: dict = {"server": server}
+                    if username:
+                        proxy_cfg["username"] = username
+                        proxy_cfg["password"] = password or ""
+                    launch_kwargs["proxy"] = proxy_cfg
                 browser = p.chromium.launch(**launch_kwargs)
                 context = browser.new_context(user_agent=user_agent)
                 context.add_init_script(self._STEALTH_JS)
                 page = context.new_page()
-                page.goto(url, timeout=int(self.config.timeout * 1000),
-                          wait_until="domcontentloaded")
-                # Give client-side rendering a beat to populate the DOM.
-                page.wait_for_timeout(1500)
-                html = page.content()
-                status = 200  # goto succeeded; real status is on the response obj
-                browser.close()
+                try:
+                    response = page.goto(url, timeout=int(self.config.timeout * 1000),
+                                         wait_until="domcontentloaded")
+                    # Give client-side rendering a beat to populate the DOM.
+                    page.wait_for_timeout(1500)
+                    html = page.content()
+                    # goto() does not raise on 4xx/5xx — report the real status
+                    # so block/HTTP-error detection works for this layer too.
+                    status = response.status if response is not None else 200
+                finally:
+                    browser.close()
             return FetchResult(
                 url=url,
                 status=status,
@@ -189,7 +237,16 @@ class NodriverLayer:
         try:
             browser_args = []
             if proxy:
-                browser_args.append(f"--proxy-server={proxy}")
+                server, username, _ = split_proxy(proxy)
+                if username:
+                    # Chrome's --proxy-server flag has no credentials field;
+                    # passing user:pass would just break navigation.
+                    return FetchResult(
+                        url=url, layer=self.name, elapsed=0.0,
+                        error="nodriver layer cannot use credentialed (user:pass) "
+                              "proxies; use an IP-whitelisted endpoint",
+                    )
+                browser_args.append(f"--proxy-server={server}")
             browser = await uc.start(
                 headless=self.config.nodriver_headless,
                 browser_args=browser_args or None,
@@ -197,13 +254,23 @@ class NodriverLayer:
             page = await browser.get(url)
 
             # Poll while the challenge auto-solves, up to nodriver_settle secs.
-            html = ""
+            # Always read at least once (nodriver_settle <= 0 would otherwise
+            # return an empty body as success).
+            html = await page.get_content()
             deadline = time.monotonic() + self.config.nodriver_settle
-            while time.monotonic() < deadline:
+            while looks_blocked(200, html) and time.monotonic() < deadline:
                 await page.sleep(1)
                 html = await page.get_content()
-                if not looks_blocked(200, html):
-                    break
+
+            # nodriver's get() swallows Page.navigate's errorText, so a DNS
+            # failure / refused connection / dead proxy shows up as Chrome's
+            # own error page. That is a failed fetch, not content.
+            if _is_chrome_error_page(html):
+                return FetchResult(
+                    url=url, layer=self.name,
+                    elapsed=time.monotonic() - start,
+                    error="navigation failed (Chrome network error page)",
+                )
 
             return FetchResult(
                 url=url,
@@ -230,4 +297,8 @@ class NodriverLayer:
         # nodriver is async-only; bridge it to our sync orchestrator. A fresh
         # event loop per call keeps layers independent (fine at our volume).
         _silence_proactor_del_noise()
-        return asyncio.run(self._run(url, proxy))
+        try:
+            return run_coro_sync(self._run(url, proxy))
+        except Exception as exc:  # noqa: BLE001 - layers report, never raise
+            return FetchResult(url=url, layer=self.name,
+                               error=f"{type(exc).__name__}: {exc}")

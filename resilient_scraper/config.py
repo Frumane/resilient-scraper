@@ -75,3 +75,10 @@ class ScraperConfig:
             "Upgrade-Insecure-Requests": "1",
         }
     )
+
+    def __post_init__(self) -> None:
+        # Accept a single proxy URL as documented above.
+        if isinstance(self.proxies, str):
+            self.proxies = [self.proxies]
+        if self.max_delay < self.min_delay:
+            self.max_delay = self.min_delay

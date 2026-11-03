@@ -29,14 +29,18 @@ class _ProxyState:
 
 
 class ProxyPool:
-    def __init__(self, proxies: list[str], max_failures: int = 3,
+    def __init__(self, proxies: list[str] | str, max_failures: int = 3,
                  cooldown: float = 300.0):
         """max_failures consecutive misses retires a proxy for `cooldown`
-        seconds, after which it's given another chance."""
+        seconds, after which it's given another chance. A single proxy URL
+        may be passed as a plain string."""
+        if isinstance(proxies, str):
+            # Iterating a str would yield one "proxy" per character.
+            proxies = [proxies]
         self._states = [_ProxyState(url=p) for p in dict.fromkeys(proxies)]
         self.max_failures = max_failures
         self.cooldown = cooldown
-        self._cursor = 0
+        self._cursor = -1   # index into self._states of the last proxy handed out
 
     def __len__(self) -> int:
         return len(self._states)
@@ -51,10 +55,16 @@ class ProxyPool:
         returns None so the caller just connects directly."""
         if not self._states:
             return None
-        active = self._active()
-        if active:
-            self._cursor = (self._cursor + 1) % len(active)
-            return active[self._cursor % len(active)].url
+        # Walk the full list from the last position so rotation stays fair
+        # even as proxies retire/recover (indexing into the shrinking active
+        # list would skip and repeat entries).
+        now = time.monotonic()
+        n = len(self._states)
+        for step in range(1, n + 1):
+            i = (self._cursor + step) % n
+            if self._states[i].retired_until <= now:
+                self._cursor = i
+                return self._states[i].url
         # All retired — hand back the soonest-to-recover as a best effort.
         return min(self._states, key=lambda s: s.retired_until).url
 
@@ -86,11 +96,14 @@ class ProxyPool:
         curl_cffi. Returns {"alive": [...], "dead": [...]}."""
         from curl_cffi import requests as cffi
 
+        from .config import BROWSER_PROFILES
+        impersonate = BROWSER_PROFILES[0][0]
+
         alive, dead = [], []
         for state in self._states:
             try:
                 r = cffi.get(test_url, proxies={"http": state.url, "https": state.url},
-                             timeout=timeout, impersonate="chrome131")
+                             timeout=timeout, impersonate=impersonate)
                 if 200 <= r.status_code < 400:
                     alive.append(state.url)
                     state.failures = 0

@@ -14,9 +14,7 @@ Public data only — same scope rules as the rest of the package."""
 
 from __future__ import annotations
 
-import asyncio
 import json
-import sys
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -101,12 +99,22 @@ def discover_apis(
       "playwright" — force Playwright (needs `playwright install chromium`)."""
     use_nodriver = engine == "nodriver" or (engine == "auto" and _nodriver_ready())
     if use_nodriver:
-        results = _discover_nodriver(url, wait, scroll, headless, max_results)
+        try:
+            results = _discover_nodriver(url, wait, scroll, headless, max_results)
+        except Exception:  # noqa: BLE001 - e.g. no Chrome binary installed
+            if engine == "nodriver":
+                raise
+            return _discover_playwright(url, wait, scroll, headless, max_results)
         # A headless run that finds nothing on a protected site is the classic
         # "the bot check hid everything" case — a visible window clears far more
-        # challenges, so retry headful once before giving up.
+        # challenges, so retry headful once before giving up. Best effort: on a
+        # machine with no display the headful launch fails, and "nothing found"
+        # is still the honest answer.
         if not results and headless:
-            results = _discover_nodriver(url, wait, scroll, False, max_results)
+            try:
+                results = _discover_nodriver(url, wait, scroll, False, max_results)
+            except Exception:  # noqa: BLE001
+                results = []
         return results
     return _discover_playwright(url, wait, scroll, headless, max_results)
 
@@ -123,28 +131,43 @@ def _discover_nodriver(url, wait, scroll, headless, max_results):  # noqa: ANN00
     """Capture data endpoints via nodriver + raw CDP Network events. Because
     it drives a genuine, un-flagged Chrome, the page actually loads its data —
     so its hidden API is visible where a vanilla headless browser gets blocked."""
-    if sys.platform == "win32":
-        from .layers import _silence_proactor_del_noise
-        _silence_proactor_del_noise()
+    from .layers import _silence_proactor_del_noise
+    _silence_proactor_del_noise()      # no-op off Windows
 
     async def run() -> dict[str, ApiEndpoint]:
         import nodriver as uc
         from nodriver import cdp
 
         found: dict[str, ApiEndpoint] = {}
-        # url -> (status, mime, rtype). Keyed by URL so repeated pages dedupe.
+        # url -> (status, mime, rtype, request_id). Keyed by URL so repeated
+        # calls dedupe.
         seen: dict[str, tuple] = {}
-        browser = await uc.start(headless=headless)
+        methods: dict[str, str] = {}          # request_id -> HTTP method
+        browser = None
         try:
+            browser = await uc.start(headless=headless)
             tab = await browser.get("about:blank")
-            await tab.send(cdp.network.enable())
+            # Generous buffers so response bodies are still readable later.
+            await tab.send(cdp.network.enable(
+                max_total_buffer_size=100_000_000,
+                max_resource_buffer_size=20_000_000,
+            ))
+
+            async def on_request(evt: "cdp.network.RequestWillBeSent") -> None:
+                methods[str(evt.request_id)] = evt.request.method
 
             async def on_response(evt: "cdp.network.ResponseReceived") -> None:
                 r = evt.response
-                rtype = str(getattr(evt, "type_", "") or "")
+                t = getattr(evt, "type_", None)
+                # ResourceType is a plain Enum: str() gives "ResourceType.XHR".
+                rtype = str(getattr(t, "value", t) or "").lower()
+                if rtype not in ("xhr", "fetch"):
+                    return
                 if "json" in (r.mime_type or "").lower() and 200 <= r.status < 300:
-                    seen.setdefault(r.url, (r.status, r.mime_type, rtype))
+                    seen.setdefault(r.url, (r.status, r.mime_type, rtype,
+                                            evt.request_id))
 
+            tab.add_handler(cdp.network.RequestWillBeSent, on_request)
             tab.add_handler(cdp.network.ResponseReceived, on_response)
             await tab.get(url)
 
@@ -155,26 +178,38 @@ def _discover_nodriver(url, wait, scroll, headless, max_results):  # noqa: ANN00
                     await tab.scroll_down(300)
                 await tab.sleep(wait / rounds)
 
-            # Retrieve each body by re-fetching it *inside the page* — runs with
-            # the browser's cookies and un-flagged fingerprint, so it succeeds
-            # where a bare CDP body-read (or an outside HTTP client) would be
-            # blocked. Reliable, and it dodges CDP's response-buffer eviction.
-            for u, (status, mime, rtype) in list(seen.items()):
+            # Read the body the page actually received (CDP getResponseBody):
+            # no second request, so POST/GraphQL and header-authenticated
+            # APIs keep their real method and body, and CORS never applies.
+            for u, (status, mime, rtype, request_id) in list(seen.items()):
+                method = methods.get(str(request_id), "GET")
                 try:
-                    js = f"fetch({u!r}, {{credentials: 'include'}}).then(r => r.text())"
-                    body = await tab.evaluate(js, await_promise=True)
-                    if body:
-                        _record(found, u, "GET", status, mime or "", rtype or "xhr", body)
-                except Exception:  # noqa: BLE001 - skip anything we can't re-read
-                    continue
+                    body, b64 = await tab.send(
+                        cdp.network.get_response_body(request_id))
+                    if b64:
+                        import base64
+                        body = base64.b64decode(body).decode("utf-8", "replace")
+                except Exception:  # noqa: BLE001 - body evicted
+                    if method != "GET":
+                        continue  # can't faithfully replay a non-GET
+                    try:
+                        js = (f"fetch({json.dumps(u)}).then(r => r.ok ? r.text() "
+                              f": '')")
+                        body = await tab.evaluate(js, await_promise=True)
+                    except Exception:  # noqa: BLE001
+                        continue
+                if body:
+                    _record(found, u, method, status, mime or "", rtype, body)
             return found
         finally:
-            try:
-                browser.stop()
-            except Exception:  # noqa: BLE001
-                pass
+            if browser is not None:
+                try:
+                    browser.stop()
+                except Exception:  # noqa: BLE001
+                    pass
 
-    found = asyncio.run(run())
+    from .layers import run_coro_sync
+    found = run_coro_sync(run())
     return _rank(found, max_results)
 
 

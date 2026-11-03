@@ -18,7 +18,7 @@ classifiers = [
     "Intended Audience :: Developers",
     "Topic :: Internet :: WWW/HTTP",
 ]
-dependencies = ["curl_cffi>=0.7"]
+dependencies = ["curl_cffi>=0.8"]
 
 [project.optional-dependencies]
 # Browser layers + API discovery. Install with:  pip install resilient-scraper[browser]
